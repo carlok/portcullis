@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+ONBOARDING.md
+.pytest_cache/
