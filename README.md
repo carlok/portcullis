@@ -1,70 +1,59 @@
-# Hetzner VM Hardening Provisioner
+# Portcullis
 
-Independent Hetzner Cloud Ubuntu hardening provisioner, currently smoke-tested
-on Ubuntu 26.04.
+[![test](https://github.com/carlok/portcullis/actions/workflows/test.yml/badge.svg)](https://github.com/carlok/portcullis/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Why this exists
+One command creates a hardened Ubuntu 26.04 VM on Hetzner Cloud. The gate
+drops first: SSH and the firewalls are locked down within about 30 seconds.
+The full CIS-style hardening pass then runs behind them.
 
-A freshly created cloud VM is briefly exposed: root SSH on port 22, default
-config, while the hardening script runs its course — several minutes of
-package installs and service configuration. That window is small, but it
-exists, and automated scanners find new IPs fast.
+```bash
+cp .env.example .env   # set HCLOUD_TOKEN
+./run.sh               # provision, harden, verify
+```
 
-The approach is to separate the work into two phases:
+## Why two phases
 
-- **Phase 1 (~30s, no `apt`)** — configures only what is already present on
-  a fresh Ubuntu cloud image:
-  - UFW is enabled early: default-deny-incoming, only the new random SSH port
-    open — OS-level firewall closes the gap within seconds of first connection
-  - New unprivileged user, key-only SSH, root locked, random high port
-  - sysctl hardening, TCP wrappers, hostname set to the full Hetzner server name
-  - At exit: Hetzner Cloud Firewall updated via API — port 22 closed, random
-    port opened — a second layer on top of UFW
-- **Phase 2 (full CIS pipeline)** — runs entirely behind both firewalls, as
-  an unprivileged user on the new port: package updates, AppArmor, auditd,
-  AIDE, PAM hardening, fail2ban, rkhunter, msmtp, swap, Docker, Podman
+A new cloud VM starts with root SSH open on port 22. A typical hardening
+script spends several minutes installing packages before it closes that door,
+and scanners find new IPs quickly. Portcullis splits the work:
 
-An orchestrator drives both phases through the Hetzner Cloud API, so the
-whole thing — VM creation, hardening, verification — runs as a single command
-with no manual steps. Nothing is installed on the host; everything runs inside
-a container.
+- **Phase 1: lockdown (~30s, no `apt`).** Uses only what the stock image
+  already ships. It creates an unprivileged user with key-only SSH on a random
+  high port, locks root, enables UFW with default-deny, and applies sysctl
+  hardening. The orchestrator then switches the Hetzner Cloud Firewall from
+  port 22 to the new port and deletes the temporary API key.
+- **Phase 2: full hardening (several minutes).** Reconnects as the new user
+  behind both firewalls. It covers package upgrades, AppArmor, auditd, AIDE,
+  PAM policy, fail2ban, rkhunter, msmtp alerts, swap, Docker and Podman.
+- **Verify.** `verify.sh` runs 58 checks on the finished host and reports
+  any failures.
 
-The result is a CIS Level 1/2 hardened Ubuntu 26.04 VM, fully automated,
-in under 15 minutes.
+Everything runs inside a Podman container, so nothing is installed on your
+machine. A full run takes under 15 minutes.
 
----
+## Design
 
-## Background
+- **Python orchestrator.** `provision.py` drives the Hetzner Cloud API and
+  both SSH sessions. If provisioning fails partway, it deletes the server, key
+  and firewall it created.
+- **SSH config in two layers.** Phase 1 owns `sshd_config` (port, key-only
+  auth, `AllowUsers`). Phase 2 adds only a drop-in,
+  `sshd_config.d/50-cis-hardening.conf`, for ciphers and MACs, so it never
+  overwrites access settings.
+- **Two firewalls kept aligned.** UFW on the host and the Hetzner Cloud
+  Firewall at the network edge both allow only the SSH port.
+- **msmtp, not postfix.** A daemonless SMTP client serves as the system MTA,
+  so auditd, AIDE, rkhunter and logwatch can send email without a mail server
+  running.
+- **Container runtimes that work.** Docker and Podman are installed and usable
+  by the operator. AppArmor profiles known to break OCI runtimes on 26.04 are
+  left disabled.
+- **Clean teardown.** `destroy.py` removes a server together with its
+  firewalls and leftover provisioning keys.
 
-This is now an independent provisioner for Hetzner Cloud Ubuntu VMs. It keeps a
-CIS-oriented section layout for auditability, while the implementation is a
-two-phase orchestrated workflow: immediate lockdown first, then the full
-hardening pass behind both UFW and the Hetzner Cloud Firewall.
-
-The current default target is Ubuntu 26.04. Other Hetzner Ubuntu image slugs can
-be selected with `OS_IMAGE`, but they should be smoke-tested before being used
-for real workloads.
-
-- **Split into two phases.** A single-pass hardening run leaves the VM exposed
-  on port 22 with root access for the full duration (several minutes). This
-  project separates the work into an immediate lockdown phase (~30 seconds, no
-  package installs) and a full CIS phase, so the attack surface is minimised
-  from the very first seconds of the VM's life.
-- **Added a Python orchestrator** (`provision.py`) that drives both phases via
-  the Hetzner Cloud API: creates the VM and firewall, runs Phase 1, closes
-  port 22 at the network level, reconnects as the new unprivileged user, then
-  runs Phase 2.
-- **SSH hardening split**: Phase 1 writes the complete `sshd_config` (custom
-  port, key-only auth, AllowUsers). Phase 2 adds a drop-in at
-  `sshd_config.d/50-cis-hardening.conf` for cipher and MAC hardening without
-  overwriting Phase 1's access settings.
-- **Replaced postfix with msmtp** for lightweight SMTP-relay-based alerting,
-  wired as the system MTA so auditd, AIDE, rkhunter, and logwatch can all send
-  email with no daemon running.
-- **Added tooling**: fail2ban, needrestart, rkhunter (with nightly cron),
-  logwatch, Docker, Podman, and Compose tooling.
-- **Added `destroy.py`**: a companion CLI tool to cleanly tear down a server
-  and all associated Hetzner resources (firewall, orphaned SSH keys).
+The default image is `ubuntu-26.04`. You can pick another Ubuntu image with
+`OS_IMAGE`, but smoke-test it before using it for real workloads.
 
 ---
 
@@ -143,7 +132,8 @@ pure configuration of pre-installed Ubuntu packages.
 - TCP wrappers: `/etc/hosts.deny ALL:ALL`, allow only sshd
 - sysctl: SYN cookies, reverse-path filtering, IPv6 disabled, ASLR, dmesg
   restrict, source-routing disabled
-- Randomises the hostname; disables ctrl-alt-del reboot; locks the root account
+- Sets the hostname to the full Hetzner server name; disables ctrl-alt-del
+  reboot; locks the root account
 
 **As soon as Phase 1 finishes, the Hetzner Cloud Firewall is updated: port 22
 is closed and only the new random port is open.**
@@ -348,13 +338,15 @@ tests, and prints a coverage report. The build fails if coverage drops below
 60 %.
 
 ```
-tests/test_provision.py   — generate_ssh_keypair, generate_random_password,
-                            _ColorFormatter, upload_string,
-                            execute_remote_script, wait_for_ssh,
-                            lockdown_firewall
-tests/test_destroy.py     — find_server, find_attached_firewalls,
-                            find_orphaned_prov_keys, find_floating_ips
+tests/test_provision.py          — key generation, logging, SFTP upload,
+                                   remote execution, SSH wait, firewall lockdown
+tests/test_destroy.py            — server, firewall, key and floating-IP lookup
+tests/test_preflight.py          — .env validation
+tests/test_availability_poll.py  — server-type availability poller
+tests/test_phase2_defaults.py    — Phase 2 default policy checks
 ```
+
+The same checks run in GitHub Actions on every push and pull request.
 
 Functions that require live Hetzner API access (`main()`, `destroy()`) are
 integration concerns and are not unit tested here.
@@ -391,9 +383,26 @@ integration concerns and are not unit tested here.
 | `harden-phase1.sh` | Phase 1 script (immediate lockdown, no apt) |
 | `harden-phase2.sh` | Phase 2 script (full CIS pipeline) |
 | `verify.sh` | Post-provisioning health check — 58 automated checks (SSH, UFW, sysctl, swap, services, AIDE, rkhunter, msmtp, Docker, Podman, network ports, disk) |
-| `Dockerfile` | Container image for the provisioner |
-| `run.sh` | Wrapper: `./run.sh` to provision, `./run.sh destroy` to tear down |
+| `preflight.py` | Validate `.env` before creating any resources |
+| `Dockerfile` | Container image for the provisioner (`prod` and `test` stages) |
+| `run.sh` | Wrapper: provision, `preflight`, `destroy`, `test` |
 | `availability/poll.py` | Daily-check script for reported Hetzner server-type availability |
 | `availability/cron.example` | Example daily cron entry for the availability poller |
 | `logs/` | Host-side logs — `<mode>-<timestamp>.log` for each run |
+| `tests/` | Unit tests (pytest) |
 | `.env.example` | Configuration template |
+
+---
+
+## Origins
+
+Portcullis started in March 2026 from a fork of
+[AndyHS-506/Ubuntu-Hardening](https://github.com/AndyHS-506/Ubuntu-Hardening),
+a single-pass CIS hardening script for Ubuntu 24.04. The original script was
+dropped early on. The two-phase design, orchestrator, tests and tooling were
+all written later. The CIS-style section numbering in `harden-phase2.sh` is
+kept for auditability.
+
+## License
+
+[MIT](LICENSE)
