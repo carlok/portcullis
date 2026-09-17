@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: bash -n run.sh harden-phase1.sh harden-phase2.sh verify.sh
+
+      - name: Build test image
+        run: docker build --target test -t portcullis-test .
+
+      - name: shellcheck + pytest (coverage >= 60%)
+        run: docker run --rm portcullis-test
