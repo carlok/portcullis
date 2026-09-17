@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/portcullis.png" alt="Portcullis logo" width="180">
+</p>
+
 # Portcullis
 
 [![test](https://github.com/carlok/portcullis/actions/workflows/test.yml/badge.svg)](https://github.com/carlok/portcullis/actions/workflows/test.yml)
