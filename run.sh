@@ -20,6 +20,7 @@ if [ ! -f .env ]; then
 fi
 
 mkdir -p ./keys ./logs
+chmod 700 ./keys ./logs
 
 echo "Building provisioner image..."
 podman build --target prod -t cloud-vm-provisioner . --quiet

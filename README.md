@@ -45,6 +45,8 @@ machine. A full run takes under 15 minutes.
   auth, `AllowUsers`). Phase 2 adds only a drop-in,
   `sshd_config.d/50-cis-hardening.conf`, for ciphers and MACs, so it never
   overwrites access settings.
+- **Same host, both phases.** The SSH host key seen in Phase 1 is pinned;
+  Phase 2 refuses to connect if the server presents a different key.
 - **Two firewalls kept aligned.** UFW on the host and the Hetzner Cloud
   Firewall at the network edge both allow only the SSH port.
 - **msmtp, not postfix.** A daemonless SMTP client serves as the system MTA,

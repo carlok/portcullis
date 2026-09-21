@@ -12,6 +12,7 @@ Phase 2 (mins):  Full CIS hardening — package updates, auditd, AIDE, fail2ban,
 
 import io
 import os
+import shlex
 import time
 import uuid
 import secrets
@@ -26,6 +27,8 @@ from hcloud.firewalls.domain import FirewallRule
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import paramiko
+
+from preflight import validate_config
 
 
 # ─────────────────────────────────────────────────────────────
@@ -88,6 +91,35 @@ def generate_ssh_keypair() -> tuple[str, str]:
     return private_pem, public_openssh
 
 
+def write_private_key(path: str, private_pem: str) -> None:
+    """Write the private key with mode 0600 from creation (no readable window)."""
+    if os.path.exists(path):
+        os.remove(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(private_pem)
+
+
+def build_smtp_env(env) -> str | None:
+    """Return smtp.env content for Phase 2, or None when SMTP is not configured.
+
+    Phase 2 sources this file with bash, so every value is shell-quoted:
+    passwords containing $, spaces, quotes or backticks survive unchanged.
+    """
+    smtp_host = env.get("SMTP_HOST", "")
+    if not smtp_host:
+        return None
+    values = {
+        "SMTP_HOST":   smtp_host,
+        "SMTP_PORT":   env.get("SMTP_PORT", "587"),
+        "SMTP_USER":   env.get("SMTP_USER", ""),
+        "SMTP_PASS":   env.get("SMTP_PASS", ""),
+        "SMTP_FROM":   env.get("SMTP_FROM", ""),
+        "ALERT_EMAIL": env.get("ALERT_EMAIL", "root"),
+    }
+    return "\n".join(f"{k}={shlex.quote(v)}" for k, v in values.items()) + "\n"
+
+
 def generate_random_password(length: int = 20) -> str:
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
     while True:
@@ -110,13 +142,25 @@ def wait_for_ssh(
     password: str | None = None,
     port: int = 22,
     timeout: int = 300,
+    host_key: paramiko.PKey | None = None,
 ) -> paramiko.SSHClient:
+    """Connect once SSH answers.
+
+    Without *host_key* the first key seen is trusted (fresh VM, TOFU).
+    With *host_key* only that exact key is accepted; a mismatch aborts
+    immediately instead of retrying.
+    """
     logger.info(f"Waiting for SSH at {username}@{ip}:{port} ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            if host_key is None:
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            else:
+                host_id = ip if port == 22 else f"[{ip}]:{port}"
+                client.get_host_keys().add(host_id, host_key.get_name(), host_key)
+                client.set_missing_host_key_policy(paramiko.RejectPolicy())
             client.connect(
                 ip, port=port, username=username,
                 key_filename=key_filename, password=password,
@@ -127,16 +171,28 @@ def wait_for_ssh(
                 logger.info(f"SSH connection established on port {port}.")
                 return client
             client.close()
+        except paramiko.BadHostKeyException:
+            raise
         except Exception as exc:
             logger.info(f"SSH not ready yet on port {port} ({exc}); retrying in 5s...")
             time.sleep(5)
     raise TimeoutError(f"SSH at {ip}:{port} did not become available within {timeout}s.")
 
 
-def upload_string(ssh_client: paramiko.SSHClient, content: str, remote_path: str) -> None:
-    """Upload a string as a file on the remote host."""
+def upload_string(
+    ssh_client: paramiko.SSHClient,
+    content: str,
+    remote_path: str,
+    mode: int | None = None,
+) -> None:
+    """Upload a string as a file on the remote host.
+
+    When *mode* is given it is applied before any content is written.
+    """
     sftp = ssh_client.open_sftp()
     with sftp.file(remote_path, "w") as f:
+        if mode is not None:
+            sftp.chmod(remote_path, mode)
         f.write(content)
     sftp.close()
     logger.debug(f"Uploaded content to {remote_path}")
@@ -265,11 +321,17 @@ def main() -> None:
     has_ws = any(c.isspace() for c in token)
     logger.debug(
         f"Token diagnostics: len={len(token)} (raw_len={len(raw_token)}) "
-        f"first4={token[:4]!r} last4={token[-4:]!r} "
         f"has_whitespace={has_ws} has_quotes={has_quotes}"
     )
     if len(raw_token) != len(token):
         logger.warning(f"Token had {len(raw_token) - len(token)} leading/trailing whitespace chars — stripped.")
+
+    config_errors = validate_config(os.environ)
+    if config_errors:
+        for error in config_errors:
+            logger.critical(f"Config: {error}")
+        logger.critical("Invalid configuration (see ./run.sh preflight). Aborting.")
+        return
 
     client = Client(token=token)
 
@@ -284,17 +346,7 @@ def main() -> None:
     ssh_port = secrets.choice(range(10_000, 60_000))
 
     # SMTP (optional) — forwarded to Phase 2 for msmtp setup
-    smtp_env_content = None
-    smtp_host = os.getenv("SMTP_HOST", "")
-    if smtp_host:
-        smtp_env_content = "\n".join([
-            f"SMTP_HOST={smtp_host}",
-            f"SMTP_PORT={os.getenv('SMTP_PORT', '587')}",
-            f"SMTP_USER={os.getenv('SMTP_USER', '')}",
-            f"SMTP_PASS={os.getenv('SMTP_PASS', '')}",
-            f"SMTP_FROM={os.getenv('SMTP_FROM', '')}",
-            f"ALERT_EMAIL={os.getenv('ALERT_EMAIL', 'root')}",
-        ])
+    smtp_env_content = build_smtp_env(os.environ)
 
     key_path = "/workspace/id_rsa"
 
@@ -309,9 +361,7 @@ def main() -> None:
     try:
         # ── Generate keypair ───────────────────────────────────
         priv_key, pub_key = generate_ssh_keypair()
-        with open(key_path, "w") as fh:
-            fh.write(priv_key)
-        os.chmod(key_path, 0o600)
+        write_private_key(key_path, priv_key)
         logger.info(f"Private key saved to {key_path}")
 
         # ── Upload key to Hetzner (for root access at VM boot) ─
@@ -362,6 +412,12 @@ def main() -> None:
         t_phase1 = time.time()
 
         ssh_client = wait_for_ssh(server_ip, "root", key_filename=key_path)
+        # Pin this host key: Phase 2 must reach the same machine.
+        server_host_key = ssh_client.get_transport().get_remote_server_key()
+        logger.info(
+            f"Host key pinned: {server_host_key.get_name()} "
+            f"{server_host_key.fingerprint}"
+        )
 
         # Upload the public key so Phase 1 can install it for the new user
         upload_string(ssh_client, pub_key, "/tmp/provisioner_pub_key")
@@ -371,7 +427,7 @@ def main() -> None:
         execute_remote_script(
             ssh_client,
             "harden-phase1.sh",
-            args=f"{new_user} {ssh_port} {server_name}",
+            args=shlex.join([new_user, str(ssh_port), server_name]),
             use_sudo=False,
         )
         logger.info("Phase 1 script finished.")
@@ -432,11 +488,14 @@ def main() -> None:
             server_ip, new_user,
             key_filename=key_path,
             port=ssh_port,
+            host_key=server_host_key,
         )
 
         # Upload SMTP credentials if provided
         if smtp_env_content:
-            upload_string(ssh_client, smtp_env_content, f"/home/{new_user}/smtp.env")
+            upload_string(
+                ssh_client, smtp_env_content, f"/home/{new_user}/smtp.env", mode=0o600,
+            )
             logger.info("SMTP credentials uploaded for msmtp configuration.")
 
         execute_remote_script(
@@ -453,7 +512,8 @@ def main() -> None:
         verify_failures = execute_remote_script(
             ssh_client,
             "verify.sh",
-            args=f"{new_user} {ssh_port} {smtp_flag}",
+            args=shlex.join([new_user, str(ssh_port), smtp_flag] if smtp_flag
+                            else [new_user, str(ssh_port)]),
             use_sudo=True,
             allow_nonzero=True,
         )
