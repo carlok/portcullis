@@ -11,7 +11,13 @@ from unittest.mock import MagicMock, patch
 import paramiko
 import pytest
 
-from provision import build_smtp_env, upload_string, wait_for_ssh, write_private_key
+from provision import (
+    TrustOnFirstUsePolicy,
+    build_smtp_env,
+    upload_string,
+    wait_for_ssh,
+    write_private_key,
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -132,12 +138,22 @@ def _ok_client():
 class TestWaitForSshPinning:
     @patch("provision.paramiko.SSHClient")
     @patch("provision.time.sleep")
-    def test_unpinned_uses_auto_add(self, _sleep, mock_cls):
+    def test_unpinned_uses_trust_on_first_use(self, _sleep, mock_cls):
         client = _ok_client()
         mock_cls.return_value = client
         wait_for_ssh("1.2.3.4", "root", key_filename="/k")
         policy = client.set_missing_host_key_policy.call_args[0][0]
-        assert isinstance(policy, paramiko.AutoAddPolicy)
+        assert isinstance(policy, TrustOnFirstUsePolicy)
+
+    def test_trust_on_first_use_logs_fingerprint(self, caplog, host_key):
+        with caplog.at_level("INFO"):
+            TrustOnFirstUsePolicy().missing_host_key(MagicMock(), "1.2.3.4", host_key)
+        assert host_key.fingerprint in caplog.text
+
+    def test_trust_on_first_use_does_not_persist_the_key(self, host_key):
+        client = MagicMock()
+        TrustOnFirstUsePolicy().missing_host_key(client, "1.2.3.4", host_key)
+        client.get_host_keys.return_value.add.assert_not_called()
 
     @patch("provision.paramiko.SSHClient")
     @patch("provision.time.sleep")

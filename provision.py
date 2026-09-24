@@ -134,6 +134,24 @@ def generate_random_password(length: int = 20) -> str:
 # SSH / SFTP helpers
 # ─────────────────────────────────────────────────────────────
 
+class TrustOnFirstUsePolicy(paramiko.MissingHostKeyPolicy):
+    """Accept the host key of a VM we have just created, and log it.
+
+    Phase 1 is the first contact with a machine created seconds earlier by
+    this same process, so there is nothing to compare its key against: no
+    prior connection, and Hetzner does not publish the fingerprint through
+    the API. The key is accepted once, its fingerprint is logged, and
+    Phase 2 then connects with that exact key pinned (see wait_for_ssh),
+    so any later substitution is detected.
+    """
+
+    def missing_host_key(self, client, hostname, key) -> None:
+        logger.info(
+            f"Trusting host key of new VM {hostname}: "
+            f"{key.get_name()} {key.fingerprint}"
+        )
+
+
 def wait_for_ssh(
     ip: str,
     username: str,
@@ -146,7 +164,8 @@ def wait_for_ssh(
 ) -> paramiko.SSHClient:
     """Connect once SSH answers.
 
-    Without *host_key* the first key seen is trusted (fresh VM, TOFU).
+    Without *host_key* the first key seen is trusted and logged
+    (TrustOnFirstUsePolicy — only valid for a VM created moments ago).
     With *host_key* only that exact key is accepted; a mismatch aborts
     immediately instead of retrying.
     """
@@ -156,7 +175,7 @@ def wait_for_ssh(
         try:
             client = paramiko.SSHClient()
             if host_key is None:
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.set_missing_host_key_policy(TrustOnFirstUsePolicy())
             else:
                 host_id = ip if port == 22 else f"[{ip}]:{port}"
                 client.get_host_keys().add(host_id, host_key.get_name(), host_key)
