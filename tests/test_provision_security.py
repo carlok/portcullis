@@ -13,6 +13,8 @@ import pytest
 
 from provision import (
     TrustOnFirstUsePolicy,
+    build_public_net,
+    firewall_sources,
     build_smtp_env,
     upload_string,
     wait_for_ssh,
@@ -178,3 +180,21 @@ class TestWaitForSshPinning:
             wait_for_ssh("1.2.3.4", "svc", key_filename="/k", port=40000, host_key=host_key)
         assert client.connect.call_count == 1
         mock_sleep.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────
+# build_public_net (ENABLE_IPV6)
+# ─────────────────────────────────────────────────────────────
+
+class TestBuildPublicNet:
+    def test_ipv6_enabled(self):
+        net = build_public_net(True)
+        assert net.enable_ipv4 is True and net.enable_ipv6 is True
+
+    def test_ipv6_disabled_keeps_ipv4(self):
+        net = build_public_net(False)
+        assert net.enable_ipv4 is True and net.enable_ipv6 is False
+
+    def test_firewall_sources_follow_the_flag(self):
+        assert firewall_sources(True) == ["0.0.0.0/0", "::/0"]
+        assert firewall_sources(False) == ["0.0.0.0/0"]

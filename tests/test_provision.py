@@ -337,6 +337,11 @@ class TestLockdownFirewall:
         assert "0.0.0.0/0" in source_ips
         assert "::/0" in source_ips
 
+    def test_ipv4_only_when_ipv6_disabled(self):
+        fw = MagicMock()
+        lockdown_firewall(fw, 12345, enable_ipv6=False)
+        assert fw.set_rules.call_args[0][0][0].source_ips == ["0.0.0.0/0"]
+
     def test_different_ports_produce_different_rules(self):
         fw = MagicMock()
         lockdown_firewall(fw, 10000)

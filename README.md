@@ -368,6 +368,7 @@ integration concerns and are not unit tested here.
 | `SERVER_TYPE` | `cx22` | Hetzner server type |
 | `LOCATION` | `fsn1` | Hetzner datacenter location |
 | `OS_IMAGE` | `ubuntu-26.04` | Base OS image |
+| `ENABLE_IPV6` | `true` | Public IPv6 (`true`/`false`). `false` allocates no IPv6 address and keeps the Hetzner firewall rules IPv4-only; IPv4 is always created. The hardening scripts disable IPv6 inside the OS either way, so with `true` the address is reserved but unused unless you re-enable it |
 | `NEW_USER_NAME` | _(random)_ | Override the provisioned username |
 | `SMTP_HOST` | — | SMTP relay hostname (enables msmtp + email alerts) |
 | `SMTP_PORT` | `587` | SMTP port (STARTTLS) |

@@ -22,13 +22,14 @@ from dotenv import load_dotenv
 from hcloud import Client
 from hcloud.server_types.domain import ServerType
 from hcloud.images.domain import Image
+from hcloud.servers.domain import ServerCreatePublicNetwork
 from hcloud.locations.domain import Location
 from hcloud.firewalls.domain import FirewallRule
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import paramiko
 
-from preflight import validate_config
+from preflight import parse_bool, validate_config
 
 
 # ─────────────────────────────────────────────────────────────
@@ -98,6 +99,11 @@ def write_private_key(path: str, private_pem: str) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as fh:
         fh.write(private_pem)
+
+
+def build_public_net(enable_ipv6: bool) -> ServerCreatePublicNetwork:
+    """Public network settings for the new VM: always IPv4, IPv6 on request."""
+    return ServerCreatePublicNetwork(enable_ipv4=True, enable_ipv6=enable_ipv6)
 
 
 def build_smtp_env(env) -> str | None:
@@ -297,7 +303,12 @@ def execute_remote_script(
 # Hetzner firewall helpers
 # ─────────────────────────────────────────────────────────────
 
-def lockdown_firewall(firewall, ssh_port: int) -> None:
+def firewall_sources(enable_ipv6: bool) -> list[str]:
+    """Source ranges for firewall rules: IPv4 always, IPv6 only when enabled."""
+    return ["0.0.0.0/0", "::/0"] if enable_ipv6 else ["0.0.0.0/0"]
+
+
+def lockdown_firewall(firewall, ssh_port: int, enable_ipv6: bool = True) -> None:
     """Replace all inbound rules with: only the new SSH port."""
     logger.info(f"Locking down Hetzner firewall — closing port 22, opening {ssh_port}/tcp ...")
     actions = firewall.set_rules([
@@ -305,7 +316,7 @@ def lockdown_firewall(firewall, ssh_port: int) -> None:
             direction="in",
             protocol="tcp",
             port=str(ssh_port),
-            source_ips=["0.0.0.0/0", "::/0"],
+            source_ips=firewall_sources(enable_ipv6),
         )
     ])
     for action in actions:
@@ -360,6 +371,7 @@ def main() -> None:
     server_type = os.getenv("SERVER_TYPE", "cx22")
     location    = os.getenv("LOCATION",    "fsn1")
     os_image    = os.getenv("OS_IMAGE",    "ubuntu-26.04")
+    enable_ipv6 = parse_bool(os.getenv("ENABLE_IPV6", "")) is not False  # default: true
 
     new_user = os.getenv("NEW_USER_NAME") or f"svc_{uuid.uuid4().hex[:8]}"
     ssh_port = secrets.choice(range(10_000, 60_000))
@@ -394,7 +406,7 @@ def main() -> None:
             name=f"fw-{server_name}",
             rules=[FirewallRule(
                 direction="in", protocol="tcp", port="22",
-                source_ips=["0.0.0.0/0", "::/0"],
+                source_ips=firewall_sources(enable_ipv6),
             )],
         )
         firewall = fw_resp.firewall
@@ -408,12 +420,15 @@ def main() -> None:
             location=Location(name=location),
             firewalls=[firewall],
             ssh_keys=[hcloud_key],
+            public_net=build_public_net(enable_ipv6),
         )
         server = vm_resp.server
         vm_resp.action.wait_until_finished()
         server = client.servers.get_by_id(server.id)
         server_ip = server.public_net.ipv4.ip
         logger.info(f"VM ready. IP: {server_ip}")
+        if enable_ipv6 and server.public_net.ipv6:
+            logger.info(f"IPv6 network allocated: {server.public_net.ipv6.ip}")
 
         # ── Highlight key identifiers ─────────────────────────
         _HL = "\033[1;97;44m"  # bold white on blue background
@@ -486,7 +501,7 @@ def main() -> None:
         logger.info(f"Phase 1 completed in {p1_secs}s.")
 
         # ── Close port 22 at Hetzner level — VM is now locked down ──
-        lockdown_firewall(firewall, ssh_port)
+        lockdown_firewall(firewall, ssh_port, enable_ipv6)
 
         # ── Clean up Hetzner SSH key (no longer needed) ───────
         logger.info("Removing temporary Hetzner provisioning key...")

@@ -1,6 +1,8 @@
 """Unit tests for local preflight configuration validation."""
 
-from preflight import validate_config
+import pytest
+
+from preflight import parse_bool, validate_config
 
 
 def valid_env(**overrides):
@@ -67,3 +69,29 @@ class TestValidateConfig:
             ALERT_EMAIL="ops@example.com",
         ))
         assert errors == []
+
+
+class TestEnableIpv6:
+    @pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "on", " False ", "0", "no", "off"])
+    def test_accepts_boolean_words(self, value):
+        assert validate_config(valid_env(ENABLE_IPV6=value)) == []
+
+    def test_unset_is_valid(self):
+        assert validate_config(valid_env()) == []
+
+    @pytest.mark.parametrize("value", ["maybe", "2", "enable", ""])
+    def test_rejects_other_values_when_set(self, value):
+        env = valid_env(ENABLE_IPV6=value)
+        errors = validate_config(env)
+        if value == "":
+            assert errors == []  # blank falls back to the default (true)
+        else:
+            assert any("ENABLE_IPV6" in e for e in errors)
+
+    @pytest.mark.parametrize("value,expected", [
+        ("true", True), ("Yes", True), ("1", True), ("ON", True),
+        ("false", False), ("No", False), ("0", False), ("off", False),
+        ("nope", None), ("", None),
+    ])
+    def test_parse_bool(self, value, expected):
+        assert parse_bool(value) is expected
